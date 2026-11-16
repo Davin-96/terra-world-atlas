@@ -126,6 +126,24 @@
     XKX: ["kosovo"], CZE: ["czech republic"], SWZ: ["swaziland"], TLS: ["east timor"],
     CPV: ["cape verde"], MKD: ["macedonia"], BHS: ["bahamas"], GMB: ["the gambia"]
   };
+  // 焦点组：同属一个主权范围、在地图上必须一并显示的地区。
+  // 中国台湾地区、中国香港、中国澳门在数据中均为中国的组成部分
+  // （sovereign:false、kind 分别为「中国台湾地区」「属地/特别行政区」），
+  // 单独呈现会造成割裂，因此这四个条目与「中国」同属一个焦点组：
+  // 任一方被选中时整组一并高亮，并共用同一组陆上邻国口径。
+  // 注意：50m 数据中香港、澳门与中国大陆共享边界弧，若不并入焦点组，
+  // 它们会被误算成中国的「陆上邻国」（16 个），与中国官方口径（14 个）不符。
+  const FOCUS_GROUPS = [
+    ["CHN", "TWN", "HKG", "MAC"]
+  ];
+  const FOCUS_GROUP_OF = new Map();
+  for (const g of FOCUS_GROUPS) for (const a3 of g) FOCUS_GROUP_OF.set(a3, g);
+
+  // 返回选中主体的焦点组成员（含主体自身）；无焦点组时返回 [主体]。
+  function focusMembers(primary) {
+    if (!primary) return [];
+    return FOCUS_GROUP_OF.get(primary) || [primary];
+  }
 
   const state = {
     mode: "globe",
@@ -686,13 +704,11 @@
 
     let nbs = null;
     if (state.selected) {
-      const prep = activePrep();
-      const list = prep && prep.neighbors.get(state.selected);
-      if (list && list.length) {
-        nbs = new Set(list);
-        nbs.delete(state.selected);
-        if (!nbs.size) nbs = null;
-      }
+      // 焦点组共用同一组陆上邻国口径：取组内成员邻国的并集，再剔除组内成员本身。
+      // 香港、澳门在 50m 数据中与中国大陆共享边界弧（会被拓扑算成中国的邻国），
+      // 但它们是中国的一部分，不是中国的邻国，因此随焦点组一并剔除，
+      // 使中国的陆上邻国口径与官方数据一致（14 个，而非 16 个）。
+      nbs = groupNeighborSet(activePrep(), state.selected);
     }
     state.neighborSet = nbs;
 
@@ -788,6 +804,8 @@
     }
     state.exitAnim = {
       a3,
+      // 焦点组成员一并淡出，避免中国退出时中国台湾地区瞬间跳变。
+      group: focusMembers(a3),
       nbs: state.neighborSet ? new Set(state.neighborSet) : null,
       t0: performance.now(),
       duration: 560,
@@ -826,16 +844,21 @@
     openInfo();
     updateAll();
     if (opts.focus !== false) {
-      if (state.mode === "globe") rotateTo(c.lat, c.lon);
-      else if (opts.zoom !== false) focusFlatCountry(a3);
+      if (state.mode === "globe") {
+        // 焦点组定位：中国台湾地区随中国定位到同一范围。
+        const pt = groupPoint(activePrep(), a3) || [c.lon, c.lat];
+        rotateTo(pt[1], pt[0]);
+      } else if (opts.zoom !== false) focusFlatCountry(a3);
     }
     state.dirty = true;
     if (window.innerWidth <= 900) closeSidebar();
   }
 
   // 再次点击已选中的国家/地区则退出高亮，否则选中它。
+  // 焦点组成员（如中国台湾地区）视为与主体同一点击：点击组内任一成员都退出高亮。
   function selectCountryToggle(a3, opts = {}) {
-    if (state.selected === a3) {
+    const members = state.selected ? focusMembers(state.selected) : [];
+    if (state.selected === a3 || (members.length > 1 && members.includes(a3))) {
       clearCountry();
       return true;
     }
@@ -1236,6 +1259,9 @@
     const nbs = state.neighborSet;
     const hasHL = !!hl;
     const selected = state.selected;
+    // 焦点组：与选中主体同属一个范围的成员（中国 ↔ 中国台湾地区），
+    // 渲染时与焦点国同等对待，视为同一主体的组成部分。
+    const focusGroup = new Set(selected ? focusMembers(selected) : []);
     const hover = state.hover ? state.hover.a3 : null;
     const many = hasHL && hl.size > 80;
     const k = opts.flat ? state.flatZoom.k : 1;
@@ -1254,12 +1280,14 @@
       }
       const a3 = f.__a3;
       const isSel = a3 === selected;
+      // 焦点组成员与焦点国同色同权重（区别于"邻国"的亮青）。
+      const isFocus = !isSel && focusGroup.has(a3);
       const isHov = a3 === hover;
       const isMem = !hasHL || hl.has(a3);
-      const isNb = !!nbs && nbs.has(a3) && !isSel;
+      const isNb = !!nbs && nbs.has(a3) && !isSel && !isFocus;
       let fill, stroke, width, halo = false, nbHalo = false;
 
-      if (isSel) {
+      if (isSel || isFocus) {
         fill = "rgba(255,199,107,.55)";
         stroke = "rgba(255,234,190,.98)";
         width = 1.6;
@@ -1297,7 +1325,7 @@
       ctx.fillStyle = fill;
       ctx.fill();
 
-      if (isSel) {
+      if (isSel || isFocus) {
         ctx.save();
         ctx.shadowColor = "rgba(255,199,107,.85)";
         ctx.shadowBlur = 16 / k;
@@ -1323,19 +1351,19 @@
     }
 
     // outlines on top (enclaves / tiny states)
-    if (selected) {
-      const f = prep.byA3Feature.get(selected);
-      if (f) {
-        ctx.save();
-        ctx.beginPath();
-        path(f);
-        ctx.strokeStyle = "rgba(255,234,190,.95)";
-        ctx.lineWidth = lw(1.7);
-        ctx.shadowColor = "rgba(255,199,107,.9)";
-        ctx.shadowBlur = 14 / k;
-        ctx.stroke();
-        ctx.restore();
-      }
+    // 焦点组成员一并描边，确保「中国台湾地区」与「中国」视觉上连成一体。
+    for (const focusA3 of focusGroup) {
+      const f = prep.byA3Feature.get(focusA3);
+      if (!f) continue;
+      ctx.save();
+      ctx.beginPath();
+      path(f);
+      ctx.strokeStyle = "rgba(255,234,190,.95)";
+      ctx.lineWidth = lw(1.7);
+      ctx.shadowColor = "rgba(255,199,107,.9)";
+      ctx.shadowBlur = 14 / k;
+      ctx.stroke();
+      ctx.restore();
     }
     if (hover && hover !== selected) {
       const f = prep.byA3Feature.get(hover);
@@ -1353,8 +1381,10 @@
     const ex = state.exitAnim;
     if (ex && ex.progress > 0) {
       const p = ex.progress;
-      const selF = prep.byA3Feature.get(ex.a3);
-      if (selF) {
+      // 焦点组（含中国台湾地区）随主体一同淡出。
+      for (const gA3 of (ex.group || [ex.a3])) {
+        const selF = prep.byA3Feature.get(gA3);
+        if (!selF) continue;
         ctx.save();
         ctx.beginPath();
         path(selF);
@@ -1583,6 +1613,7 @@
     const hl = state.highlightSet;
     const nbs = state.neighborSet;
     const force = hl && hl.size <= 30;
+    const focusGroup = new Set(state.selected ? focusMembers(state.selected) : []);
     const items = [];
     ctx.font = '10.5px "PingFang SC","Microsoft YaHei",sans-serif';
     for (const f of prep.feats) {
@@ -1591,18 +1622,20 @@
       const c = byA3.get(a3);
       if (!c) continue;
       const isSel = a3 === state.selected;
+      // 焦点组成员随焦点国一同标注（如「中国台湾地区」随「中国」显示）。
+      const isFocus = !isSel && focusGroup.has(a3);
       const isHov = state.hover && a3 === state.hover.a3;
-      const isNb = !!nbs && nbs.has(a3) && !isSel;
-      if (hl && !hl.has(a3) && !isSel && !isHov && !isNb) continue;
+      const isNb = !!nbs && nbs.has(a3) && !isSel && !isFocus;
+      if (hl && !hl.has(a3) && !isSel && !isFocus && !isHov && !isNb) continue;
       const area = f.__area * z.k * z.k;
-      if (!force && !isSel && !isHov && !isNb && area < 0.0065) continue;
+      if (!force && !isSel && !isFocus && !isHov && !isNb && area < 0.0065) continue;
       const p = state.flatProj(f.__centroid);
       if (!p) continue;
       const x = z.x + p[0] * z.k;
       const y = z.y + p[1] * z.k;
       if (x < -30 || y < -20 || x > state.w + 30 || y > state.h + 20) continue;
       const text = c.zh;
-      items.push({ text, x, y, area, isSel, isHov, isNb, a3 });
+      items.push({ text, x, y, area, isSel, isHov, isNb, isFocus, a3 });
     }
     items.sort((a, b) => (a.isSel - b.isSel) || (a.isHov - b.isHov) || (b.area - a.area));
 
@@ -1611,7 +1644,7 @@
       const width = ctx.measureText(item.text).width + 8;
       const height = 13;
       const box = { x: item.x - width / 2, y: item.y - height / 2, w: width, h: height };
-      if (!item.isSel && !item.isHov) {
+      if (!item.isSel && !item.isFocus && !item.isHov) {
         let overlap = false;
         for (const r of placed) {
           if (box.x < r.x + r.w && box.x + box.w > r.x && box.y < r.y + r.h && box.y + box.h > r.y) {
@@ -1627,7 +1660,7 @@
       ctx.lineWidth = 3;
       ctx.strokeStyle = "rgba(2,8,12,.82)";
       ctx.strokeText(item.text, item.x, item.y);
-      if (item.isSel) ctx.fillStyle = "#ffe4ae";
+      if (item.isSel || item.isFocus) ctx.fillStyle = "#ffe4ae";
       else if (item.isHov) ctx.fillStyle = "#ffffff";
       else if (item.isNb) ctx.fillStyle = "rgba(168,240,250,.95)";
       else if (hl && hl.has(item.a3)) ctx.fillStyle = "rgba(180,250,255,.96)";
@@ -1641,6 +1674,7 @@
     const hl = state.highlightSet;
     const z = state.flatZoom;
     const proj = opts.flat ? state.flatProj : state.globeProj;
+    const focusGroup = new Set(state.selected ? focusMembers(state.selected) : []);
     if (!proj) return;
     for (const m of prep.markers) {
       if (!opts.flat && !visibleOnGlobe(m.lon, m.lat, proj)) continue;
@@ -1649,31 +1683,33 @@
       const x = opts.flat ? z.x + p[0] * z.k : p[0];
       const y = opts.flat ? z.y + p[1] * z.k : p[1];
       const isSel = m.a3 === state.selected;
+      // 焦点组成员的标记点与焦点国同色（如中国台湾地区的标记随中国一并显示）。
+      const isFocus = !isSel && focusGroup.has(m.a3);
       const isHov = state.hover && m.a3 === state.hover.a3;
       const isMem = !hl || hl.has(m.a3);
-      const isNb = !!state.neighborSet && state.neighborSet.has(m.a3) && !isSel;
+      const isNb = !!state.neighborSet && state.neighborSet.has(m.a3) && !isSel && !isFocus;
       if (x < -10 || y < -10 || x > state.w + 10 || y > state.h + 10) continue;
 
-      const color = isSel ? "#ffe4ae" : (isNb ? "rgba(150,236,248,.95)" : (isMem ? "rgba(150,248,255,.95)" : "rgba(70,130,150,.32)"));
-      const r = isSel || isHov ? 3.9 : (isNb ? 3 : (isMem ? 2.8 : 2));
+      const color = (isSel || isFocus) ? "#ffe4ae" : (isNb ? "rgba(150,236,248,.95)" : (isMem ? "rgba(150,248,255,.95)" : "rgba(70,130,150,.32)"));
+      const r = (isSel || isFocus) || isHov ? 3.9 : (isNb ? 3 : (isMem ? 2.8 : 2));
       ctx.save();
-      ctx.shadowColor = isSel ? "rgba(255,199,107,.9)" : "rgba(69,230,255,.85)";
-      ctx.shadowBlur = isSel || isHov ? 12 : 7;
+      ctx.shadowColor = (isSel || isFocus) ? "rgba(255,199,107,.9)" : "rgba(69,230,255,.85)";
+      ctx.shadowBlur = (isSel || isFocus) || isHov ? 12 : 7;
       ctx.beginPath();
       ctx.arc(x, y, r, 0, TAU);
       ctx.fillStyle = color;
       ctx.fill();
       ctx.restore();
 
-      if (isHov || isSel) {
+      if (isHov || isSel || isFocus) {
         ctx.beginPath();
         ctx.arc(x, y, 7.5, 0, TAU);
-        ctx.strokeStyle = isSel ? "rgba(255,228,174,.6)" : "rgba(180,250,255,.55)";
+        ctx.strokeStyle = (isSel || isFocus) ? "rgba(255,228,174,.6)" : "rgba(180,250,255,.55)";
         ctx.lineWidth = 0.8;
         ctx.stroke();
       }
 
-      if (opts.flat && (isSel || isHov || z.k > 2.4)) {
+      if (opts.flat && (isSel || isFocus || isHov || z.k > 2.4)) {
         const c = byA3.get(m.a3);
         if (c) {
           ctx.font = '10px "PingFang SC","Microsoft YaHei",sans-serif';
@@ -1682,7 +1718,7 @@
           ctx.lineWidth = 3;
           ctx.strokeStyle = "rgba(2,8,12,.85)";
           ctx.strokeText(c.zh, x + 7, y - 1);
-          ctx.fillStyle = isSel ? "#ffe4ae" : "rgba(190,248,255,.95)";
+          ctx.fillStyle = (isSel || isFocus) ? "#ffe4ae" : "rgba(190,248,255,.95)";
           ctx.fillText(c.zh, x + 7, y - 1);
         }
       }
@@ -2072,11 +2108,45 @@
     </div>`;
   }
 
+  // 焦点组成员的合并陆上邻国集合（中国、中国台湾地区、中国香港、中国澳门 视为同一主体范围）。
+  // 取组内成员邻国的并集后剔除组内成员本身：
+  // 香港、澳门在 50m 数据中与中国大陆共享边界弧，若不剔除会被误算成中国的邻国，
+  // 使口径变为 16 个；剔除后为中国官方口径的 14 个。
+  function groupNeighborSet(prep, primary) {
+    if (!prep) return null;
+    const members = focusMembers(primary);
+    const merged = new Set();
+    for (const m of members) {
+      const list = prep.neighbors.get(m);
+      if (list) for (const x of list) merged.add(x);
+    }
+    for (const m of members) merged.delete(m);
+    return merged.size ? merged : null;
+  }
+
+  // 焦点组的代表点：按要素面积加权平均，中国台湾地区随中国定位。
+  function groupPoint(prep, primary) {
+    const c = byA3.get(primary);
+    if (!c) return null;
+    const members = focusMembers(primary);
+    if (members.length <= 1) return [c.lon, c.lat];
+    let sx = 0, sy = 0, sw = 0;
+    for (const m of members) {
+      const f = prep && prep.byA3Feature.get(m);
+      const mc = byA3.get(m);
+      if (!f || !mc) continue;
+      const w = Math.max(f.__area, 1e-9);
+      sx += mc.lon * w; sy += mc.lat * w; sw += w;
+    }
+    return sw ? [sx / sw, sy / sw] : [c.lon, c.lat];
+  }
+
   function neighborsText(c) {
-    const prep = state.prep50 || state.prep110;
-    let nbs = prep && prep.neighbors.get(c.a3);
-    if (!nbs || !nbs.length) return "无陆上邻国";
-    const sorted = nbs.slice().sort((a, b) => ((byA3.get(b) || {}).pop || 0) - ((byA3.get(a) || {}).pop || 0));
+    // 与地图高亮使用同一套数据源（activePrep），避免面板数字与图上高亮不一致。
+    const prep = activePrep();
+    const nbs = groupNeighborSet(prep, c.a3);
+    if (!nbs || !nbs.size) return "无陆上邻国";
+    const sorted = [...nbs].sort((a, b) => ((byA3.get(b) || {}).pop || 0) - ((byA3.get(a) || {}).pop || 0));
     const names = sorted.map((a) => byA3.get(a) ? byA3.get(a).zh : a);
     const head = names.slice(0, 5).join("、");
     return `${names.length} 个${names.length > 5 ? " · " + head + " 等" : " · " + head}`;
@@ -2096,6 +2166,12 @@
     const note = KIND_NOTE[c.a3] || (!c.sovereign ? "该条目为属地或特殊地区，非主权国家。" : "");
     const nbNote = state.neighborSet && state.neighborSet.size
       ? ' <span class="nb-hint">已在地图次高亮</span>'
+      : "";
+    // 焦点组构成说明：告知该主体的地图显示范围包含哪些同组地区，
+    // 以及同组各条目在陆上邻国口径上视为一个整体。
+    const groupMembers = focusMembers(c.a3).filter((a) => a !== c.a3);
+    const groupNote = groupMembers.length
+      ? `<div class="data-note" style="margin-top:10px">本条目与 ${groupMembers.map((a) => esc((byA3.get(a) || {}).zh || a)).join("、")} 同属一个整体，地图上作为同一显示范围一并高亮，陆上邻国口径按合并后计算。</div>`
       : "";
 
     setEyebrow(`MEMBER PROFILE / <b>${esc(org ? org.abbr : c.a3)}</b>`);
@@ -2120,6 +2196,7 @@
         <div class="stat-cell"><dt>坐标 COORDINATES</dt><dd class="mono">${coords.la} / ${coords.lo}</dd></div>
         <div class="stat-cell wide"><dt>陆上邻国 LAND NEIGHBORS</dt><dd>${esc(neighborsText(c))}${nbNote}</dd></div>
       </dl>
+      ${groupNote}
       ${detailed ? `
         <div class="section"><h3>历史脉络<span class="en">HISTORY</span></h3><p>${esc(c.h)}</p></div>
         <div class="section"><h3>文化名片<span class="en">CULTURE</span></h3><p>${esc(c.c)}</p></div>
