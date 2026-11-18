@@ -139,6 +139,16 @@
   const FOCUS_GROUP_OF = new Map();
   for (const g of FOCUS_GROUPS) for (const a3 of g) FOCUS_GROUP_OF.set(a3, g);
 
+  // 国标口径中国地理要素：国界轮廓 + 南海十段线（由 vendor/china-geo.js 提供）。
+  // 地图以该轮廓为中国主权的权威画法：争议区（阿克赛钦、藏南等）按中国口径并入，
+  // 相邻国家在中国轮廓内的部分会被裁掉，确保中印、中缅、中越等边界只保留一条线。
+  const CN_GEO = window.TERRA_CN || null;
+  const CN_OUTLINE = CN_GEO && CN_GEO.outline ? CN_GEO.outline : null;
+  const CN_DASH = CN_GEO && CN_GEO.dash ? CN_GEO.dash : null;
+  // 交界无缝：邻国几何减去国标中国轮廓后的差集（按精度分组，a3 索引）。
+  // 用它替换相交国家的原始几何，使交界边界精确止于中国国界，消除空隙与双线。
+  const CN_CLIP = window.TERRA_CN_CLIP || null;
+
   // 返回选中主体的焦点组成员（含主体自身）；无焦点组时返回 [主体]。
   function focusMembers(primary) {
     if (!primary) return [];
@@ -414,7 +424,7 @@
     });
   }
 
-  function prepTopology(topology) {
+  function prepTopology(topology, kind) {
     const collection = topojson.feature(topology, topology.objects.countries);
     const feats = collection.features;
     const geoms = topology.objects.countries.geometries;
@@ -433,6 +443,11 @@
       }
       if (!a3 && f.properties) a3 = NAME_MAP[f.properties.name] || null;
       f.__a3 = a3;
+      // 交界无缝：用「邻国 − 国标中国」差集几何替换相交国家原始几何，
+      // 使邻国边界精确止于中国国界，消除两套数据不重合造成的空隙/双线。
+      // 焦点组(CHN/TWN/HKG/MAC)不在此列，由国标轮廓统一绘制；命中测试随几何同步。
+      const clipMap = CN_CLIP && CN_CLIP[kind];
+      if (a3 && clipMap && clipMap[a3]) f.geometry = clipMap[a3];
       if (a3) {
         f.__name = byA3.get(a3) ? byA3.get(a3).zh : (f.properties.name || a3);
         f.__centroid = d3.geoCentroid(f);
@@ -515,7 +530,7 @@
     if (state.loading50) return state.loading50;
     state.loading50 = loadGeo("50", GEO_50)
       .then((topo) => {
-        state.prep50 = prepTopology(topo);
+        state.prep50 = prepTopology(topo, "50");
         refreshHighlight();
         if (state.mode === "flat") {
           hideStageMsg();
@@ -1254,6 +1269,148 @@
     drawSelectionHalo(ctx, { flat: true });
   }
 
+  // 以国标口径中国轮廓为权威边界：先把「整个画布 minus 中国轮廓」设为 even-odd 裁剪区，
+  // 邻国（印度、缅甸、俄罗斯等）在中国轮廓内的部分——含争议区（阿克赛钦、藏南）——
+  // 其填充与边界线都会被裁掉。随后在最上层单独画中国国标轮廓，
+  // 于是中印、中缅等边界最终只剩中国这一条线，且画法以国标为准。
+  function chinaClipAndDrawBase(ctx, path, prep, opts, drawBase) {
+    // 已改用几何差集：邻国几何本身已减去中国轮廓，无需再叠加 even-odd 裁剪。
+    // 保留裁剪会在交界处（尤其 rasters 抗锯齿）露出背景色细缝，故直接绘制。
+    if (CN_CLIP) { drawBase(); return false; }
+    if (!CN_OUTLINE) { drawBase(); return false; }
+    ctx.save();
+    ctx.beginPath();
+    // 覆盖当前视图的矩形（取极大范围，配合各视图已有 clip / transform）。
+    ctx.rect(-1e7, -1e7, 2e7, 2e7);
+    // 追加中国国界子路径；even-odd 规则下，中国轮廓内部成为裁剪「洞」。
+    path(CN_OUTLINE);
+    ctx.clip("evenodd");
+    try {
+      drawBase();
+    } finally {
+      ctx.restore();
+    }
+    return true;
+  }
+
+  // 在最上层绘制国标口径中国轮廓，配色随焦点组 / 邻国 / 悬停 / 集团高亮联动。
+  function drawChinaSovereignty(ctx, path, opts) {
+    if (!CN_OUTLINE) return;
+    const k = opts.flat ? state.flatZoom.k : 1;
+    const lw = (px) => px / k;
+    const selected = state.selected;
+    const hover = state.hover ? state.hover.a3 : null;
+    const nbs = state.neighborSet;
+    const hl = state.highlightSet;
+    const hasHL = !!hl;
+    const many = hasHL && hl.size > 80;
+    const cnGroup = FOCUS_GROUP_OF.get("CHN");
+
+    // 中国是否处于焦点（选中主体在中国焦点组内）。
+    const isFocus = selected && cnGroup && cnGroup.includes(selected);
+    // 中国是否为当前焦点国的陆上邻国。
+    const isNb = !!nbs && cnGroup && cnGroup.some((a) => nbs.has(a)) && !isFocus;
+    const isHov = hover && cnGroup && cnGroup.includes(hover) && !isFocus;
+    const isMem = !hasHL || cnGroup.some((a) => hl.has(a));
+
+    let fill, stroke, width, halo = false, nbHalo = false;
+    if (isFocus) {
+      fill = "rgba(255,199,107,.55)"; stroke = "rgba(255,234,190,.98)"; width = 1.6;
+    } else if (isNb) {
+      fill = "rgba(104,228,248,.82)"; stroke = "rgba(196,252,255,.98)"; width = 1.2; nbHalo = true;
+    } else if (isHov) {
+      fill = isMem ? "rgba(72,180,200,.86)" : "rgba(55,95,110,.5)";
+      stroke = "rgba(225,255,255,.95)"; width = 1.3;
+    } else if (hasHL && isMem) {
+      fill = many ? "rgba(32,140,166,.40)" : "rgba(40,162,190,.52)";
+      stroke = many ? "rgba(116,210,228,.78)" : "rgba(132,234,250,.84)";
+      width = 1; halo = !many;
+    } else if (!hasHL) {
+      fill = "rgba(15,45,58,.84)"; stroke = "rgba(84,186,208,.46)"; width = 0.75;
+    } else {
+      fill = "rgba(24,58,72,.86)"; stroke = "rgba(86,168,186,.42)"; width = 0.75;
+    }
+
+    ctx.save();
+    ctx.beginPath();
+    path(CN_OUTLINE);
+    ctx.fillStyle = fill;
+    ctx.fill();
+    if (isFocus) {
+      ctx.shadowColor = "rgba(255,199,107,.85)";
+      ctx.shadowBlur = 16 / k;
+      ctx.strokeStyle = stroke;
+      ctx.lineWidth = lw(width);
+      ctx.lineJoin = "round";
+      ctx.stroke();
+    } else if (halo || nbHalo) {
+      ctx.strokeStyle = nbHalo ? "rgba(110,222,240,.14)" : "rgba(69,230,255,.16)";
+      ctx.lineWidth = lw(nbHalo ? 2.8 : 3.4);
+      ctx.lineJoin = "round";
+      ctx.stroke();
+      ctx.strokeStyle = stroke;
+      ctx.lineWidth = lw(width);
+      ctx.stroke();
+    } else {
+      ctx.strokeStyle = stroke;
+      ctx.lineWidth = lw(width);
+      ctx.lineJoin = "round";
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    // 焦点态下再描一道金色轮廓光晕，与焦点组机制保持一致。
+    if (isFocus) {
+      ctx.save();
+      ctx.beginPath();
+      path(CN_OUTLINE);
+      ctx.strokeStyle = "rgba(255,234,190,.95)";
+      ctx.lineWidth = lw(1.7);
+      ctx.shadowColor = "rgba(255,199,107,.9)";
+      ctx.shadowBlur = 14 / k;
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // 退出高亮的缓入缓出转场：焦点组离场时，国标轮廓按 progress 淡出金色。
+    const ex = state.exitAnim;
+    if (ex && ex.progress > 0 && ex.group && ex.group.some((a) => cnGroup && cnGroup.includes(a))) {
+      const p = ex.progress;
+      ctx.save();
+      ctx.beginPath();
+      path(CN_OUTLINE);
+      ctx.fillStyle = "rgba(255,199,107," + (0.55 * p).toFixed(3) + ")";
+      ctx.fill();
+      ctx.shadowColor = "rgba(255,199,107," + (0.85 * p).toFixed(3) + ")";
+      ctx.shadowBlur = 16 / k;
+      ctx.strokeStyle = "rgba(255,234,190," + (0.98 * p).toFixed(3) + ")";
+      ctx.lineWidth = lw(1.6);
+      ctx.lineJoin = "round";
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  // 始终绘制南海十段线（国标断续线），随中国焦点态略微提亮。
+  function drawChinaDash(ctx, path, opts) {
+    if (!CN_DASH) return;
+    const k = opts.flat ? state.flatZoom.k : 1;
+    const lw = (px) => px / k;
+    const selected = state.selected;
+    const cnGroup = FOCUS_GROUP_OF.get("CHN");
+    const isFocus = selected && cnGroup && cnGroup.includes(selected);
+    ctx.save();
+    ctx.beginPath();
+    path(CN_DASH);
+    ctx.fillStyle = isFocus ? "rgba(255,214,150,.96)" : "rgba(255,199,107,.82)";
+    ctx.fill();
+    ctx.strokeStyle = isFocus ? "rgba(255,240,210,.98)" : "rgba(255,224,178,.9)";
+    ctx.lineWidth = lw(isFocus ? 1.15 : 0.95);
+    ctx.lineJoin = "round";
+    ctx.stroke();
+    ctx.restore();
+  }
+
   function drawFeatures(ctx, path, prep, opts) {
     const hl = state.highlightSet;
     const nbs = state.neighborSet;
@@ -1267,7 +1424,23 @@
     const k = opts.flat ? state.flatZoom.k : 1;
     const lw = (px) => px / k;
 
+    // 关键：中国焦点组成员的底图几何先被裁掉（含争议区），统一由国标轮廓绘制，
+    // 避免出现 Natural Earth 与国标两套中国轮廓重叠、或争议区被邻国二次覆盖。
+    chinaClipAndDrawBase(ctx, path, prep, opts, () => {
+      drawFeatureLoop(ctx, path, prep, opts, { hl, nbs, hasHL, selected, focusGroup, hover, many, k, lw });
+    });
+    // 国标中国轮廓 + 南海十段线画在最上层。
+    drawChinaSovereignty(ctx, path, opts);
+    drawChinaDash(ctx, path, opts);
+  }
+
+  function drawFeatureLoop(ctx, path, prep, opts, env) {
+    const { hl, nbs, hasHL, selected, focusGroup, hover, many, k, lw } = env;
+    const cnGroup = FOCUS_GROUP_OF.get("CHN");
+    const skipSet = (CN_OUTLINE && cnGroup) ? new Set(cnGroup) : null;
+
     for (const f of prep.feats) {
+      if (skipSet && skipSet.has(f.__a3)) continue;
       if (!f.__a3) {
         ctx.beginPath();
         path(f);
@@ -1352,7 +1525,11 @@
 
     // outlines on top (enclaves / tiny states)
     // 焦点组成员一并描边，确保「中国台湾地区」与「中国」视觉上连成一体。
+    // 关键：中国焦点组(CHN/TWN/HKG/MAC)由国标轮廓 drawChinaSovereignty 全权绘制，
+    // 这里若再用 Natural Earth 原始几何描一遍，两套边界不重合会在交界处露出
+    // 错位线/缝隙，故跳过；其余焦点组(如选中印度)仍按原逻辑描边。
     for (const focusA3 of focusGroup) {
+      if (cnGroup && cnGroup.includes(focusA3)) continue;
       const f = prep.byA3Feature.get(focusA3);
       if (!f) continue;
       ctx.save();
@@ -1845,6 +2022,19 @@
    *  hit testing / hover
    * ------------------------------------------------------------------ */
 
+  // 命中测试与渲染口径一致：落在国标中国轮廓内的点优先判给中国焦点组。
+  // 港澳台若其自身几何命中则返回对应条目（保留各自档案），否则返回 CHN；
+  // 这样争议区（藏南、阿克赛钦）点击后展示的是中国，而非 Natural Earth 归出的邻国。
+  function cnHitTest(inv, prep) {
+    if (!CN_OUTLINE) return null;
+    for (const a3 of ["TWN", "HKG", "MAC"]) {
+      const f = prep.byA3Feature.get(a3);
+      if (f && d3.geoContains(f, inv)) return { type: "country", a3 };
+    }
+    if (d3.geoContains(CN_OUTLINE, inv)) return { type: "country", a3: "CHN" };
+    return null;
+  }
+
   function hitTest(px, py) {
     const prep = activePrep();
     if (!prep) return null;
@@ -1860,6 +2050,8 @@
       }
       const inv = proj.invert([px, py]);
       if (!inv || !Number.isFinite(inv[0]) || !Number.isFinite(inv[1])) return null;
+      const cnHit = cnHitTest(inv, prep);
+      if (cnHit) return cnHit;
       for (const f of prep.hitFeats) {
         if (d3.geoContains(f, inv)) return { type: "country", a3: f.__a3 };
       }
@@ -1878,6 +2070,8 @@
     }
     const inv = state.flatProj.invert([bx, by]);
     if (!inv || !Number.isFinite(inv[0]) || !Number.isFinite(inv[1])) return null;
+    const cnHit = cnHitTest(inv, prep);
+    if (cnHit) return cnHit;
     for (const f of prep.hitFeats) {
       if (d3.geoContains(f, inv)) return { type: "country", a3: f.__a3 };
     }
@@ -2724,7 +2918,7 @@
 
       const topo110 = await loadGeo("110", GEO_110, (p) => setBoot(18 + p * 54, "加载全球国界 " + Math.round(p * 100) + "%"));
       setBoot(76, "构建国家索引…");
-      state.prep110 = prepTopology(topo110);
+      state.prep110 = prepTopology(topo110, "110");
       setBoot(88, "校准投影与渲染管线…");
 
       state.canvas = canvas;

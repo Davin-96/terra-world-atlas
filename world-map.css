@@ -198,6 +198,9 @@ button { font-family: inherit; color: inherit; }
   flex: none;
 }
 .icon-btn:hover { color: var(--cyan); border-color: var(--line-2); box-shadow: 0 0 14px rgba(69, 230, 255, 0.18); }
+a.icon-btn { text-decoration: none; }
+.gh-btn svg { width: 17px; height: 17px; }
+.gh-btn:hover { color: #e6edf3; }
 .icon-btn svg { width: 16px; height: 16px; }
 .mobile-menu-btn { display: none; }
 
